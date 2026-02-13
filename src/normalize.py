@@ -218,3 +218,35 @@ def normalize_entry_picks(payload: dict[str, Any]) -> dict[str, Any]:
             "event_transfers_cost": entry_history.get("event_transfers_cost"),
         },
     }
+
+
+# ---------- Entry history (entry/{team_id}/history/) for bank/FT context ----------
+
+
+def normalize_entry_history(payload: dict[str, Any]) -> dict[str, Any]:
+    """Parse entry/{id}/history/ for current season GW history and past seasons. Used for bank/FT context."""
+    current = payload.get("current") or []
+    past = payload.get("past") or []
+    return {
+        "current": [
+            {
+                "event": to_int(gw.get("event")),
+                "points": to_int(gw.get("points")),
+                "total_points": to_int(gw.get("total_points")),
+                "rank": to_int(gw.get("rank")),
+                "event_transfers": to_int(gw.get("event_transfers")),
+                "event_transfers_cost": to_int(gw.get("event_transfers_cost")),
+                "value": to_int(gw.get("value")),
+                "points_on_bench": to_int(gw.get("points_on_bench")),
+            }
+            for gw in current
+        ],
+        "past": [
+            {
+                "season_name": s.get("season_name"),
+                "total_points": to_int(s.get("total_points")),
+                "rank": to_int(s.get("rank")),
+            }
+            for s in past
+        ],
+    }

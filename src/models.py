@@ -84,7 +84,9 @@ class Player(Base):
     element_type_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("element_types.id"), nullable=True, index=True
     )
-    now_cost: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    now_cost: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, index=True
+    )  # FPL stores in tenths (e.g. 55 = £5.5); use v_player_latest.now_cost_million for display
     status: Mapped[Optional[str]] = mapped_column(String(1), nullable=True)
     minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     total_points: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

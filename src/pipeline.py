@@ -14,6 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from src.db import get_engine, get_session, init_db
 from src.fpl_client import FPLClient
+from src.marts import init_marts
 from src.models import (
     ElementType,
     Event,
@@ -28,15 +29,18 @@ from src.normalize import (
     normalize_bootstrap_static,
     normalize_element_summary_fixtures,
     normalize_element_summary_history,
+    normalize_entry_history,
     normalize_entry_picks,
     normalize_fixtures,
 )
+from src.validate import print_report, run_validation
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://fantasy.premierleague.com/api/"
 FIXED_SLEEP = 0.25
+ELEMENT_SUMMARY_BATCH_SIZE = 20
 
 
 def _now_utc() -> datetime:
@@ -232,9 +236,10 @@ def cmd_update_core(engine, bronze_dir: Path, client: FPLClient) -> None:
     run_id = str(uuid.uuid4())
     logger.info("update_core run_id=%s", run_id)
 
-    with get_session(engine) as session:
-        init_db(engine)
+    init_db(engine)
+    init_marts(engine)
 
+    with get_session(engine) as session:
         url = f"{BASE_URL}bootstrap-static/"
         logger.info("Fetching bootstrap-static...")
         data, meta = client.get_json(url, bronze_dir, save_bronze=True)
@@ -254,10 +259,16 @@ def cmd_update_core(engine, bronze_dir: Path, client: FPLClient) -> None:
         n_fixtures = _upsert_fixtures(session, fixture_rows)
         logger.info("Upserted %s fixtures", n_fixtures)
 
+    report = run_validation(engine)
+    print_report(report)
+    if not report.is_ok():
+        raise SystemExit(1)
 
-def cmd_update_element_summaries(
-    engine, bronze_dir: Path, client: FPLClient, mode: str, n: int
-) -> None:
+
+def _player_ids_to_fetch(
+    engine, mode: str, n: int, since_hours: float | None
+) -> list[int]:
+    """Return player ids to fetch. If since_hours set, skip those fetched within that window."""
     with get_session(engine) as session:
         result = session.execute(select(Player.id))
         all_ids = [r[0] for r in result.fetchall()]
@@ -266,12 +277,70 @@ def cmd_update_element_summaries(
             result = session.execute(
                 select(Player.id).order_by(Player.total_points.desc().nullslast()).limit(n)
             )
-            player_ids = [r[0] for r in result.fetchall()]
+            candidate_ids = [r[0] for r in result.fetchall()]
     else:
-        player_ids = all_ids
+        candidate_ids = all_ids
 
+    if since_hours is None or since_hours <= 0:
+        return candidate_ids
+
+    from datetime import datetime as _dt, timedelta, timezone
+
+    from sqlalchemy import text as sql_text
+
+    # Naive UTC for comparison with SQLite datetime columns
+    cutoff = _dt.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=since_hours)
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    with get_session(engine) as session:
+        # Latest fetch per player; skip if last_fetched >= cutoff (fetched within since_hours)
+        rows = session.execute(
+            sql_text("""
+                SELECT request_key, MAX(fetched_at_utc) AS last_fetched
+                FROM meta_ingestions
+                WHERE request_key LIKE 'element-summary:%'
+                GROUP BY request_key
+                HAVING last_fetched >= :cutoff
+            """),
+            {"cutoff": cutoff_str},
+        ).fetchall()
+    recently_fetched = set()
+    for request_key, _ in rows:
+        if request_key and request_key.startswith("element-summary:"):
+            try:
+                recently_fetched.add(int(request_key.split(":")[1]))
+            except ValueError:
+                pass
+    return [pid for pid in candidate_ids if pid not in recently_fetched]
+
+
+def cmd_update_element_summaries(
+    engine, bronze_dir: Path, client: FPLClient, mode: str, n: int, since_hours: float | None
+) -> None:
+    player_ids = _player_ids_to_fetch(engine, mode, n, since_hours)
+    if not player_ids:
+        logger.info("No players to fetch (all within --since-hours or none in DB)")
+        return
+
+    run_id = str(uuid.uuid4())
+    batch_size = ELEMENT_SUMMARY_BATCH_SIZE
+    buffer_hist: list[dict] = []
+    buffer_fut: list[dict] = []
+    buffer_metas: list[dict] = []
     total_hist = 0
     total_fut = 0
+
+    def flush_buffers() -> None:
+        nonlocal total_hist, total_fut
+        if buffer_hist or buffer_fut or buffer_metas:
+            with get_session(engine) as session:
+                for m in buffer_metas:
+                    _record_meta(session, run_id, m)
+                total_hist += _upsert_player_match_history(session, buffer_hist)
+                total_fut += _upsert_player_future_fixtures(session, buffer_fut)
+            buffer_hist.clear()
+            buffer_fut.clear()
+            buffer_metas.clear()
+
     for idx, pid in enumerate(player_ids, 1):
         url = f"{BASE_URL}element-summary/{pid}/"
         try:
@@ -279,14 +348,23 @@ def cmd_update_element_summaries(
         except Exception as e:
             logger.warning("element-summary %s failed: %s", pid, e)
             continue
+        buffer_metas.append(meta)
         hist_rows = normalize_element_summary_history(pid, data)
         fut_rows = normalize_element_summary_fixtures(pid, data)
-        with get_session(engine) as session:
-            total_hist += _upsert_player_match_history(session, hist_rows)
-            total_fut += _upsert_player_future_fixtures(session, fut_rows)
-        if idx % 50 == 0 or idx == len(player_ids):
+        buffer_hist.extend(hist_rows)
+        buffer_fut.extend(fut_rows)
+        if idx % batch_size == 0:
+            flush_buffers()
+            logger.info("Element summaries [%s/%s] id=%s (flushed batch)", idx, len(player_ids), pid)
+        elif idx % 50 == 0 or idx == len(player_ids):
             logger.info("Element summaries [%s/%s] id=%s", idx, len(player_ids), pid)
+    flush_buffers()
     logger.info("Upserted %s player_match_history, %s player_future_fixtures", total_hist, total_fut)
+
+    report = run_validation(engine)
+    print_report(report)
+    if not report.is_ok():
+        raise SystemExit(1)
 
 
 def cmd_pull_team(engine, bronze_dir: Path, client: FPLClient, team_id: int, gw: int) -> None:
@@ -313,6 +391,32 @@ def cmd_pull_team(engine, bronze_dir: Path, client: FPLClient, team_id: int, gw:
         logger.info("Bank/FT: not present in response")
 
 
+def cmd_update_entry_history(engine, bronze_dir: Path, client: FPLClient, team_id: int) -> None:
+    """Fetch entry/{team_id}/history/ for bank/FT/chips context. Public, no auth."""
+    url = f"{BASE_URL}entry/{team_id}/history/"
+    logger.info("Fetching entry %s history...", team_id)
+    data, meta = client.get_json(url, bronze_dir, save_bronze=True)
+    with get_session(engine) as session:
+        _record_meta(session, None, meta)
+    parsed = normalize_entry_history(data)
+    current = parsed.get("current") or []
+    past = parsed.get("past") or []
+    logger.info("Current season: %s gameweeks", len(current))
+    if current:
+        latest = current[-1]
+        logger.info("Latest GW: event=%s points=%s total_points=%s value=%s event_transfers=%s",
+            latest.get("event"), latest.get("points"), latest.get("total_points"),
+            latest.get("value"), latest.get("event_transfers"))
+    logger.info("Past seasons: %s", len(past))
+
+
+def cmd_validate(engine) -> int:
+    """Run data quality checks; exit 1 if any fail."""
+    report = run_validation(engine)
+    print_report(report)
+    return 0 if report.is_ok() else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="FPL data pipeline")
     parser.add_argument("--db-path", default="data/fpl.sqlite", help="SQLite database path")
@@ -324,10 +428,16 @@ def main() -> int:
     p_elem = sub.add_parser("update_element_summaries", help="Fetch element-summary for players")
     p_elem.add_argument("--mode", choices=["all", "top"], default="top")
     p_elem.add_argument("--n", type=int, default=250, help="When mode=top, number of players by total_points")
+    p_elem.add_argument("--since-hours", type=float, default=None, help="Skip players last fetched within this many hours")
 
     p_team = sub.add_parser("pull_team", help="Fetch entry team picks for a gameweek")
     p_team.add_argument("--team_id", type=int, required=True)
     p_team.add_argument("--gw", type=int, required=True, help="Gameweek number")
+
+    p_entry_hist = sub.add_parser("update_entry_history", help="Fetch entry/{team_id}/history/ for bank/FT context")
+    p_entry_hist.add_argument("--team_id", type=int, required=True)
+
+    sub.add_parser("validate", help="Run data quality checks; exit 1 if any fail")
 
     args = parser.parse_args()
     engine = get_engine(args.db_path)
@@ -336,9 +446,15 @@ def main() -> int:
     if args.command == "update_core":
         cmd_update_core(engine, args.bronze_dir, client)
     elif args.command == "update_element_summaries":
-        cmd_update_element_summaries(engine, args.bronze_dir, client, args.mode, args.n)
+        cmd_update_element_summaries(
+            engine, args.bronze_dir, client, args.mode, args.n, getattr(args, "since_hours", None)
+        )
     elif args.command == "pull_team":
         cmd_pull_team(engine, args.bronze_dir, client, args.team_id, args.gw)
+    elif args.command == "update_entry_history":
+        cmd_update_entry_history(engine, args.bronze_dir, client, args.team_id)
+    elif args.command == "validate":
+        return cmd_validate(engine)
     else:
         parser.error("Unknown command")
     return 0

@@ -39,6 +39,10 @@ def _derive_endpoint_and_request_key(url: str, player_id: Optional[int] = None) 
     if m:
         team_id, gw = m.group(1), m.group(2)
         return "entry", f"entry:{team_id}:{gw}"
+    m = re.match(r"entry/(\d+)/history", rest)
+    if m:
+        team_id = m.group(1)
+        return "entry", f"entry:{team_id}:history"
     return rest.split("/")[0] if "/" in rest else rest, rest.replace("/", ":")
 
 
