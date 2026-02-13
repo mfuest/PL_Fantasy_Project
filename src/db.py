@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -59,6 +59,20 @@ def get_session(engine: Engine) -> Generator[Session, None, None]:
 
 
 def init_db(engine: Engine) -> None:
-    """Create all tables from ORM models. Idempotent."""
+    """Create all tables from ORM models, then ensure high-impact indexes exist. Idempotent."""
     Base.metadata.create_all(engine)
+    _ensure_indexes(engine)
     logger.info("Database schema created or already up to date")
+
+
+def _ensure_indexes(engine: Engine) -> None:
+    """Create indexes that may not be in the ORM (e.g. descending). Idempotent (IF NOT EXISTS)."""
+    index_sqls = [
+        # Latest fetch per request_key (e.g. skip recently fetched element-summary)
+        "CREATE INDEX IF NOT EXISTS ix_meta_ingestions_request_key_fetched_desc "
+        "ON meta_ingestions (request_key, fetched_at_utc DESC)",
+    ]
+    with engine.connect() as conn:
+        for sql in index_sqls:
+            conn.execute(text(sql))
+        conn.commit()

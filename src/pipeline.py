@@ -21,10 +21,13 @@ from src.models import (
     Fixture,
     MetaIngestion,
     Player,
+    PlayerExpectedPoints,
     PlayerFutureFixture,
     PlayerMatchHistory,
     Team,
 )
+from src.transfers import suggest_transfers
+from src.xpts import build_xpts_rows
 from src.normalize import (
     normalize_bootstrap_static,
     normalize_element_summary_fixtures,
@@ -33,7 +36,7 @@ from src.normalize import (
     normalize_entry_picks,
     normalize_fixtures,
 )
-from src.validate import print_report, run_validation
+from src.validate import print_report, run_validation, should_exit_nonzero
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -232,6 +235,25 @@ def _upsert_player_future_fixtures(session, rows: list[dict]) -> int:
     return len(rows)
 
 
+def _upsert_player_expected_points(session, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    stmt = sqlite_insert(PlayerExpectedPoints).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["player_id", "event_id"],
+        set_={
+            "xmins": stmt.excluded.xmins,
+            "xpts": stmt.excluded.xpts,
+            "xpts_att": stmt.excluded.xpts_att,
+            "xpts_def": stmt.excluded.xpts_def,
+            "xpts_app": stmt.excluded.xpts_app,
+            "computed_at_utc": stmt.excluded.computed_at_utc,
+        },
+    )
+    session.execute(stmt)
+    return len(rows)
+
+
 def cmd_update_core(engine, bronze_dir: Path, client: FPLClient) -> None:
     run_id = str(uuid.uuid4())
     logger.info("update_core run_id=%s", run_id)
@@ -261,14 +283,24 @@ def cmd_update_core(engine, bronze_dir: Path, client: FPLClient) -> None:
 
     report = run_validation(engine)
     print_report(report)
-    if not report.is_ok():
+    if should_exit_nonzero("hard", report):
         raise SystemExit(1)
 
 
 def _player_ids_to_fetch(
-    engine, mode: str, n: int, since_hours: float | None
+    engine,
+    mode: str,
+    n: int,
+    since_hours: float | None,
+    force: bool = False,
+    max_age_hours: float | None = None,
 ) -> list[int]:
-    """Return player ids to fetch. If since_hours set, skip those fetched within that window."""
+    """Return player ids to fetch.
+
+    - force: ignore since_hours skip logic; fetch all candidates.
+    - max_age_hours: if set, always include players whose last fetch is older than
+      this (refetch when age > max_age), even if they would otherwise be skipped by since_hours.
+    """
     with get_session(engine) as session:
         result = session.execute(select(Player.id))
         all_ids = [r[0] for r in result.fetchall()]
@@ -281,42 +313,93 @@ def _player_ids_to_fetch(
     else:
         candidate_ids = all_ids
 
-    if since_hours is None or since_hours <= 0:
+    if force:
         return candidate_ids
 
     from datetime import datetime as _dt, timedelta, timezone
 
     from sqlalchemy import text as sql_text
 
-    # Naive UTC for comparison with SQLite datetime columns
-    cutoff = _dt.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=since_hours)
-    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-    with get_session(engine) as session:
-        # Latest fetch per player; skip if last_fetched >= cutoff (fetched within since_hours)
-        rows = session.execute(
-            sql_text("""
-                SELECT request_key, MAX(fetched_at_utc) AS last_fetched
-                FROM meta_ingestions
-                WHERE request_key LIKE 'element-summary:%'
-                GROUP BY request_key
-                HAVING last_fetched >= :cutoff
-            """),
-            {"cutoff": cutoff_str},
-        ).fetchall()
-    recently_fetched = set()
-    for request_key, _ in rows:
-        if request_key and request_key.startswith("element-summary:"):
-            try:
-                recently_fetched.add(int(request_key.split(":")[1]))
-            except ValueError:
-                pass
-    return [pid for pid in candidate_ids if pid not in recently_fetched]
+    now_utc = _dt.now(timezone.utc).replace(tzinfo=None)
+    ids_to_fetch = set(candidate_ids)
+
+    if since_hours is not None and since_hours > 0:
+        cutoff = now_utc - timedelta(hours=since_hours)
+        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        with get_session(engine) as session:
+            rows = session.execute(
+                sql_text("""
+                    SELECT request_key, MAX(fetched_at_utc) AS last_fetched
+                    FROM meta_ingestions
+                    WHERE request_key LIKE 'element-summary:%'
+                    GROUP BY request_key
+                    HAVING last_fetched >= :cutoff
+                """),
+                {"cutoff": cutoff_str},
+            ).fetchall()
+        recently_fetched = set()
+        for request_key, _ in rows:
+            if request_key and request_key.startswith("element-summary:"):
+                try:
+                    recently_fetched.add(int(request_key.split(":")[1]))
+                except ValueError:
+                    pass
+        ids_to_fetch -= recently_fetched
+
+    if max_age_hours is not None and max_age_hours > 0:
+        max_age_cutoff = now_utc - timedelta(hours=max_age_hours)
+        max_age_str = max_age_cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        with get_session(engine) as session:
+            # Refetch if last fetch older than max_age (or never fetched: no row => not in this result)
+            rows = session.execute(
+                sql_text("""
+                    SELECT request_key
+                    FROM meta_ingestions
+                    WHERE request_key LIKE 'element-summary:%'
+                    GROUP BY request_key
+                    HAVING MAX(fetched_at_utc) < :cutoff
+                """),
+                {"cutoff": max_age_str},
+            ).fetchall()
+        stale_pids = set()
+        for (request_key,) in rows:
+            if request_key and request_key.startswith("element-summary:"):
+                try:
+                    stale_pids.add(int(request_key.split(":")[1]))
+                except ValueError:
+                    pass
+        with get_session(engine) as session:
+            fetched_keys = session.execute(
+                sql_text(
+                    "SELECT DISTINCT request_key FROM meta_ingestions WHERE request_key LIKE 'element-summary:%'"
+                )
+            ).fetchall()
+        ever_fetched = set()
+        for (rk,) in fetched_keys:
+            if rk and rk.startswith("element-summary:"):
+                try:
+                    ever_fetched.add(int(rk.split(":")[1]))
+                except ValueError:
+                    pass
+        never_fetched = [p for p in candidate_ids if p not in ever_fetched]
+        ids_to_fetch |= stale_pids | set(never_fetched)
+
+    return [pid for pid in candidate_ids if pid in ids_to_fetch]
 
 
 def cmd_update_element_summaries(
-    engine, bronze_dir: Path, client: FPLClient, mode: str, n: int, since_hours: float | None
+    engine,
+    bronze_dir: Path,
+    client: FPLClient,
+    mode: str,
+    n: int,
+    since_hours: float | None,
+    force: bool = False,
+    max_age_hours: float | None = None,
 ) -> None:
-    player_ids = _player_ids_to_fetch(engine, mode, n, since_hours)
+    player_ids = _player_ids_to_fetch(
+        engine, mode, n, since_hours, force=force, max_age_hours=max_age_hours
+    )
     if not player_ids:
         logger.info("No players to fetch (all within --since-hours or none in DB)")
         return
@@ -363,7 +446,7 @@ def cmd_update_element_summaries(
 
     report = run_validation(engine)
     print_report(report)
-    if not report.is_ok():
+    if should_exit_nonzero("hard", report):
         raise SystemExit(1)
 
 
@@ -410,11 +493,68 @@ def cmd_update_entry_history(engine, bronze_dir: Path, client: FPLClient, team_i
     logger.info("Past seasons: %s", len(past))
 
 
-def cmd_validate(engine) -> int:
-    """Run data quality checks; exit 1 if any fail."""
+def cmd_validate(engine, level: str) -> int:
+    """Run data quality checks. Exit 1 based on --level: hard (default), strict, or warn."""
     report = run_validation(engine)
     print_report(report)
-    return 0 if report.is_ok() else 1
+    return 1 if should_exit_nonzero(level, report) else 0
+
+
+def cmd_build_xpts(engine, horizon: int) -> None:
+    """Compute baseline xPts for next N gameweeks; upsert into player_expected_points; run validate (hard)."""
+    init_db(engine)
+    init_marts(engine)
+
+    rows = build_xpts_rows(engine, horizon)
+    if not rows:
+        logger.warning("No xPts rows computed (check upcoming fixtures and players)")
+    else:
+        with get_session(engine) as session:
+            n = _upsert_player_expected_points(session, rows)
+        logger.info("Upserted %s rows into player_expected_points", n)
+
+        next_ev = min(r["event_id"] for r in rows)
+        top10 = sorted(
+            [r for r in rows if r["event_id"] == next_ev],
+            key=lambda x: -x["xpts"],
+        )[:10]
+        logger.info("Top 10 by xpts for next GW (event_id=%s): %s", next_ev, top10)
+
+    report = run_validation(engine)
+    print_report(report)
+    if should_exit_nonzero("hard", report):
+        raise SystemExit(1)
+
+
+def cmd_suggest_transfers(
+    engine,
+    squad_ids: list[int],
+    bank: float = 0.0,
+    top_n: int = 10,
+) -> None:
+    """Suggest single transfers; print top N by expected points difference."""
+    init_db(engine)
+    init_marts(engine)
+    result = suggest_transfers(engine, squad_ids, bank=bank, top_n=top_n)
+    if result.event_id is not None:
+        logger.info(
+            "Next GW event_id=%s | Team xPts (no transfer)=%.2f",
+            result.event_id,
+            result.current_team_xpts,
+        )
+    for i, s in enumerate(result.suggestions, 1):
+        logger.info(
+            "%s. Sell %s (id=%s) -> Buy %s (id=%s) | delta=%.2f | new_team_xpts=%.2f",
+            i,
+            s.sell_name,
+            s.sell_id,
+            s.buy_name,
+            s.buy_id,
+            s.expected_points_difference,
+            s.new_team_xpts,
+        )
+    if not result.suggestions:
+        logger.info("No transfer suggestions (check squad, xPts, and budget)")
 
 
 def main() -> int:
@@ -429,6 +569,13 @@ def main() -> int:
     p_elem.add_argument("--mode", choices=["all", "top"], default="top")
     p_elem.add_argument("--n", type=int, default=250, help="When mode=top, number of players by total_points")
     p_elem.add_argument("--since-hours", type=float, default=None, help="Skip players last fetched within this many hours")
+    p_elem.add_argument("--force", action="store_true", help="Ignore skip logic; fetch all candidates")
+    p_elem.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=None,
+        help="If set, always refetch players whose last fetch is older than this (and never-fetched)",
+    )
 
     p_team = sub.add_parser("pull_team", help="Fetch entry team picks for a gameweek")
     p_team.add_argument("--team_id", type=int, required=True)
@@ -437,7 +584,31 @@ def main() -> int:
     p_entry_hist = sub.add_parser("update_entry_history", help="Fetch entry/{team_id}/history/ for bank/FT context")
     p_entry_hist.add_argument("--team_id", type=int, required=True)
 
-    sub.add_parser("validate", help="Run data quality checks; exit 1 if any fail")
+    p_validate = sub.add_parser("validate", help="Run data quality checks; exit 1 based on --level")
+    p_validate.add_argument(
+        "--level",
+        choices=["hard", "strict", "warn"],
+        default="hard",
+        help="hard: only hard failures exit 1; strict: hard+warn exit 1; warn: never exit 1",
+    )
+
+    p_xpts = sub.add_parser("build_xpts", help="Build baseline expected points for next N gameweeks")
+    p_xpts.add_argument("--horizon", type=int, default=3, help="Number of upcoming gameweeks (default 3)")
+
+    p_transfers = sub.add_parser("suggest_transfers", help="Suggest single transfers by expected points gain")
+    p_transfers.add_argument(
+        "--squad",
+        type=str,
+        required=True,
+        help="Comma-separated 15 player element IDs (e.g. from pull_team)",
+    )
+    p_transfers.add_argument(
+        "--bank",
+        type=float,
+        default=0.0,
+        help="Bank in FPL tenths (e.g. 5 = £0.5m); if API returns millions, multiply by 10 (default 0)",
+    )
+    p_transfers.add_argument("--top-n", type=int, default=10, help="Number of suggestions to return (default 10)")
 
     args = parser.parse_args()
     engine = get_engine(args.db_path)
@@ -447,14 +618,33 @@ def main() -> int:
         cmd_update_core(engine, args.bronze_dir, client)
     elif args.command == "update_element_summaries":
         cmd_update_element_summaries(
-            engine, args.bronze_dir, client, args.mode, args.n, getattr(args, "since_hours", None)
+            engine,
+            args.bronze_dir,
+            client,
+            args.mode,
+            args.n,
+            getattr(args, "since_hours", None),
+            force=getattr(args, "force", False),
+            max_age_hours=getattr(args, "max_age_hours", None),
         )
     elif args.command == "pull_team":
         cmd_pull_team(engine, args.bronze_dir, client, args.team_id, args.gw)
     elif args.command == "update_entry_history":
         cmd_update_entry_history(engine, args.bronze_dir, client, args.team_id)
     elif args.command == "validate":
-        return cmd_validate(engine)
+        return cmd_validate(engine, args.level)
+    elif args.command == "build_xpts":
+        cmd_build_xpts(engine, getattr(args, "horizon", 3))
+        return 0
+    elif args.command == "suggest_transfers":
+        squad_ids = [int(x.strip()) for x in args.squad.split(",") if x.strip()]
+        cmd_suggest_transfers(
+            engine,
+            squad_ids,
+            bank=getattr(args, "bank", 0.0),
+            top_n=getattr(args, "top_n", 10),
+        )
+        return 0
     else:
         parser.error("Unknown command")
     return 0

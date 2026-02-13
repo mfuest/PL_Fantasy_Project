@@ -113,7 +113,10 @@ class Fixture(Base):
     team_a_difficulty: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     ingested_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False, default=_utc_now)
 
-    __table_args__ = (Index("ix_fixtures_event_teams", "event_id", "team_h", "team_a"),)
+    __table_args__ = (
+        Index("ix_fixtures_event_teams", "event_id", "team_h", "team_a"),
+        Index("ix_fixtures_kickoff_time", "kickoff_time"),
+    )
 
 
 class PlayerMatchHistory(Base):
@@ -153,3 +156,18 @@ class PlayerFutureFixture(Base):
     kickoff_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False), nullable=True)
     difficulty: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     ingested_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False, default=_utc_now)
+
+
+class PlayerExpectedPoints(Base):
+    """Baseline expected FPL points per player per upcoming gameweek. No ML; minutes + fixture + form."""
+
+    __tablename__ = "player_expected_points"
+
+    player_id: Mapped[int] = mapped_column(Integer, ForeignKey("players.id"), primary_key=True)
+    event_id: Mapped[int] = mapped_column(Integer, ForeignKey("events.id"), primary_key=True)
+    xmins: Mapped[float] = mapped_column(Float, nullable=False)
+    xpts: Mapped[float] = mapped_column(Float, nullable=False)
+    xpts_att: Mapped[float] = mapped_column(Float, nullable=False)
+    xpts_def: Mapped[float] = mapped_column(Float, nullable=False)
+    xpts_app: Mapped[float] = mapped_column(Float, nullable=False)
+    computed_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False, default=_utc_now)

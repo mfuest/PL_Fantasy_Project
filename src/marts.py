@@ -70,19 +70,33 @@ def init_marts(engine: Engine) -> None:
         )
         conn.commit()
 
-        # Rolling minutes/points last 5 games per player (from match history)
+        # Rolling minutes/points last 5 games per player (from match history).
+        # Order by fixture kickoff_time (join to fixtures) so double-GW and postponed
+        # are correct; fallback to event_id when kickoff_time is NULL.
+        conn.execute(text("DROP VIEW IF EXISTS v_player_form"))
         conn.execute(
             text("""
-            CREATE VIEW IF NOT EXISTS v_player_form AS
-            WITH ranked AS (
+            CREATE VIEW v_player_form AS
+            WITH with_kickoff AS (
+                SELECT
+                    pmh.player_id,
+                    pmh.event_id,
+                    pmh.minutes,
+                    pmh.total_points,
+                    f.kickoff_time
+                FROM player_match_history pmh
+                LEFT JOIN fixtures f ON pmh.fixture_id_effective = f.id
+            ),
+            ranked AS (
                 SELECT
                     player_id,
-                    event_id,
                     minutes,
                     total_points,
-                    ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY event_id DESC) AS rn
-                FROM player_match_history
-                WHERE event_id IS NOT NULL
+                    ROW_NUMBER() OVER (
+                        PARTITION BY player_id
+                        ORDER BY kickoff_time DESC, event_id DESC
+                    ) AS rn
+                FROM with_kickoff
             ),
             last5 AS (
                 SELECT player_id, minutes, total_points, rn
@@ -101,4 +115,36 @@ def init_marts(engine: Engine) -> None:
         )
         conn.commit()
 
-    logger.info("Analytics views created or updated (v_player_latest, v_fixture_upcoming, v_player_form)")
+        # Expected points for the next gameweek: join player_expected_points with v_player_latest
+        # for the smallest event_id in player_expected_points (next GW we have predictions for).
+        conn.execute(
+            text("""
+            CREATE VIEW IF NOT EXISTS v_player_xpts_next AS
+            SELECT
+                x.player_id,
+                x.event_id,
+                x.xmins,
+                x.xpts,
+                x.xpts_att,
+                x.xpts_def,
+                x.xpts_app,
+                x.computed_at_utc,
+                p.web_name,
+                p.team_name,
+                p.team_short_name,
+                p.position_short,
+                p.position_name,
+                p.now_cost_million,
+                p.status,
+                p.minutes,
+                p.total_points,
+                p.form,
+                p.points_per_game
+            FROM player_expected_points x
+            INNER JOIN v_player_latest p ON x.player_id = p.id
+            WHERE x.event_id = (SELECT MIN(event_id) FROM player_expected_points)
+            """)
+        )
+        conn.commit()
+
+    logger.info("Analytics views created or updated (v_player_latest, v_fixture_upcoming, v_player_form, v_player_xpts_next)")
