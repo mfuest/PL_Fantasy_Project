@@ -1,0 +1,17 @@
+{
+  "teams": [
+    {"id": 1, "name": "Arsenal", "short_name": "ARS", "strength": 4},
+    {"id": 2, "name": "Aston Villa", "short_name": "AVL", "strength": 4}
+  ],
+  "element_types": [
+    {"id": 1, "singular_name_short": "GKP", "singular_name": "Goalkeeper", "squad_select": 2},
+    {"id": 2, "singular_name_short": "DEF", "singular_name": "Defender", "squad_select": 5}
+  ],
+  "events": [
+    {"id": 1, "name": "Gameweek 1", "deadline_time": "2024-08-16T18:00:00Z", "finished": true, "is_current": false, "is_next": false}
+  ],
+  "elements": [
+    {"id": 1, "web_name": "Raya", "first_name": "David", "second_name": "Raya", "team": 1, "element_type": 1, "now_cost": 55, "status": "a", "minutes": 900, "total_points": 45, "selected_by_percent": "12.5", "form": "4.5", "points_per_game": "4.5", "expected_goals": "0.0", "expected_assists": "0.0"},
+    {"id": 2, "web_name": "Saka", "first_name": "Bukayo", "second_name": "Saka", "team": 1, "element_type": 3, "now_cost": 100, "status": "a", "minutes": 800, "total_points": 120, "selected_by_percent": "45.2", "form": "6.2", "points_per_game": "6.0"}
+  ]
+}
