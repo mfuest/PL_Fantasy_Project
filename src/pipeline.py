@@ -28,6 +28,7 @@ from src.models import (
 )
 from src.transfers import suggest_transfers
 from src.xpts import build_xpts_rows
+from src.xpts_ml import build_xpts_rows_ml, train_model as train_xpts_model
 from src.normalize import (
     normalize_bootstrap_static,
     normalize_element_summary_fixtures,
@@ -500,12 +501,32 @@ def cmd_validate(engine, level: str) -> int:
     return 1 if should_exit_nonzero(level, report) else 0
 
 
-def cmd_build_xpts(engine, horizon: int) -> None:
-    """Compute baseline xPts for next N gameweeks; upsert into player_expected_points; run validate (hard)."""
+def cmd_train_xpts(
+    engine,
+    model_path: str | Path,
+    validation_fraction: float = 0.2,
+) -> None:
+    """Build training data from DB, train GBM, save model. No write to player_expected_points."""
+    init_db(engine)
+    init_marts(engine)
+    train_xpts_model(engine, model_path, validation_fraction=validation_fraction)
+
+
+def cmd_build_xpts(
+    engine,
+    horizon: int,
+    method: str = "baseline",
+    model_path: str | Path | None = None,
+) -> None:
+    """Compute xPts for next N gameweeks; upsert into player_expected_points; run validate (hard)."""
     init_db(engine)
     init_marts(engine)
 
-    rows = build_xpts_rows(engine, horizon)
+    if method == "ml":
+        path = model_path or Path("data/models/xpts_gbm")
+        rows = build_xpts_rows_ml(engine, horizon, path)
+    else:
+        rows = build_xpts_rows(engine, horizon)
     if not rows:
         logger.warning("No xPts rows computed (check upcoming fixtures and players)")
     else:
@@ -592,8 +613,32 @@ def main() -> int:
         help="hard: only hard failures exit 1; strict: hard+warn exit 1; warn: never exit 1",
     )
 
-    p_xpts = sub.add_parser("build_xpts", help="Build baseline expected points for next N gameweeks")
+    p_train_xpts = sub.add_parser("train_xpts", help="Train ML xPts model from player_match_history; save model file")
+    p_train_xpts.add_argument(
+        "--model-path",
+        default="data/models/xpts_gbm",
+        help="Output model path (default: data/models/xpts_gbm; .json added for XGBoost)",
+    )
+    p_train_xpts.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=0.2,
+        help="Fraction of data for validation (default 0.2)",
+    )
+
+    p_xpts = sub.add_parser("build_xpts", help="Build expected points for next N gameweeks (baseline or ML)")
     p_xpts.add_argument("--horizon", type=int, default=3, help="Number of upcoming gameweeks (default 3)")
+    p_xpts.add_argument(
+        "--method",
+        choices=["baseline", "ml"],
+        default="baseline",
+        help="baseline: rule-based; ml: use GBM model (default baseline)",
+    )
+    p_xpts.add_argument(
+        "--model-path",
+        default=None,
+        help="Path to saved model when --method ml (default: data/models/xpts_gbm)",
+    )
 
     p_transfers = sub.add_parser("suggest_transfers", help="Suggest single transfers by expected points gain")
     p_transfers.add_argument(
@@ -633,8 +678,20 @@ def main() -> int:
         cmd_update_entry_history(engine, args.bronze_dir, client, args.team_id)
     elif args.command == "validate":
         return cmd_validate(engine, args.level)
+    elif args.command == "train_xpts":
+        cmd_train_xpts(
+            engine,
+            getattr(args, "model_path", "data/models/xpts_gbm"),
+            validation_fraction=getattr(args, "validation_fraction", 0.2),
+        )
+        return 0
     elif args.command == "build_xpts":
-        cmd_build_xpts(engine, getattr(args, "horizon", 3))
+        cmd_build_xpts(
+            engine,
+            getattr(args, "horizon", 3),
+            method=getattr(args, "method", "baseline"),
+            model_path=getattr(args, "model_path", None),
+        )
         return 0
     elif args.command == "suggest_transfers":
         squad_ids = [int(x.strip()) for x in args.squad.split(",") if x.strip()]

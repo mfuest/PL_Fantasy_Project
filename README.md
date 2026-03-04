@@ -76,6 +76,8 @@ A **baseline expected points** layer (no ML) produces per-player expected FPL po
 Run after `update_core` (and ideally `update_element_summaries` for form):  
 `python -m src.pipeline build_xpts --horizon 3`
 
+**ML xPts (optional):** An XGBoost GBM can be used instead of the baseline. Install ML extras: `pip install -e ".[ml]"`. Train once from historical `player_match_history`: `python -m src.pipeline train_xpts [--model-path data/models/xpts_gbm] [--validation-fraction 0.2]`. Then run `python -m src.pipeline build_xpts --method ml --horizon 3` (uses same `player_expected_points` table; transfer engine and API unchanged). Default model path: `data/models/xpts_gbm.json`.
+
 ---
 
 ## Transfer engine and API
